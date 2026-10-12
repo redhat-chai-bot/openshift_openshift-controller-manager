@@ -98,8 +98,8 @@ type DeploymentController struct {
 }
 
 // handle processes a deployment and either creates a deployer pod or responds
-// to a terminal deployment status. Since this controller started using caches,
-// the provided rc MUST be deep-copied beforehand (see work() in factory.go).
+// to a terminal deployment status. The provided deployment may come from an
+// informer cache and must remain read-only.
 func (c *DeploymentController) handle(deployment *corev1.ReplicationController, willBeDropped bool) error {
 	// Copy all the annotations from the deployment.
 	updatedAnnotations := make(map[string]string)
@@ -112,7 +112,9 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 
 	deployerPodName := appsutil.DeployerPodNameForDeployment(deployment.Name)
 	deployer, deployerErr := c.podLister.Pods(deployment.Namespace).Get(deployerPodName)
-	if deployerErr == nil {
+	// Only this deployment's deployer may supply status or completion metadata.
+	deployerBelongsToDeployment := deployerErr == nil && appsutil.DeploymentNameFor(deployer) == deployment.Name
+	if deployerBelongsToDeployment {
 		nextStatus = c.nextStatus(deployer, deployment, updatedAnnotations)
 	}
 
@@ -139,7 +141,9 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 		if err != nil {
 			return err
 		}
-		if rolloutExceededTimeoutSeconds(config, deployment) {
+		// A successful deployer takes precedence: this timeout only covers failure
+		// to create a deployer pod.
+		if nextStatus != appsv1.DeploymentStatusComplete && rolloutExceededTimeoutSeconds(config, deployment) {
 			nextStatus = appsv1.DeploymentStatusFailed
 			updatedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnableToCreateDeployerPod
 			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "RolloutTimeout", fmt.Sprintf("Rollout for %q failed to create deployer pod (timeoutSeconds: %ds)", appsutil.LabelForDeployment(deployment),
@@ -193,7 +197,7 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 			// to ensure that changes to 'unrelated' pods don't result in updates to
 			// the deployment. So, the image check will have to be done in other areas
 			// of the code as well.
-			if appsutil.DeploymentNameFor(deployer) != deployment.Name {
+			if !deployerBelongsToDeployment {
 				nextStatus = appsv1.DeploymentStatusFailed
 				updatedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnrelatedDeploymentExists
 				c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "FailedCreate", fmt.Sprintf("Error creating deployer pod since another pod with the same name (%q) exists", deployer.Name))
@@ -269,11 +273,10 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 		// preserve deployer pods on completed deployments
 	}
 
-	deploymentCopy := deployment.DeepCopy()
-
 	// Update only if we need to transition to a new phase.
 	if appsutil.CanTransitionPhase(currentStatus, nextStatus) {
 		updatedAnnotations[appsv1.DeploymentStatusAnnotation] = string(nextStatus)
+		deploymentCopy := deployment.DeepCopy()
 		deploymentCopy.Annotations = updatedAnnotations
 
 		// If we are going to transition to failed or complete and scale is non-zero, we'll check one more
@@ -290,7 +293,7 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 		}
 		klog.V(4).Infof("Updated rollout status for %q from %s to %s (scale: %d)", appsutil.LabelForDeployment(deploymentCopy), currentStatus, nextStatus, *deploymentCopy.Spec.Replicas)
 
-		if appsutil.IsDeploymentCancelled(deploymentCopy) && appsutil.IsFailedDeployment(deploymentCopy) {
+		if appsutil.IsDeploymentCancelled(deployment) && appsutil.IsFailedDeployment(deploymentCopy) {
 			c.emitDeploymentEvent(deploymentCopy, corev1.EventTypeNormal, "RolloutCancelled", fmt.Sprintf("Rollout for %q cancelled", appsutil.LabelForDeployment(deploymentCopy)))
 		}
 	}
@@ -306,12 +309,9 @@ func (c *DeploymentController) nextStatus(pod *corev1.Pod, deployment *corev1.Re
 		return appsv1.DeploymentStatusRunning
 
 	case corev1.PodSucceeded:
-		// If the deployment was cancelled just prior to the deployer pod succeeding
-		// then we need to remove the cancel annotations from the complete deployment
-		// and emit an event letting users know their cancellation failed.
+		// Prefer a recorded cancellation over deployer completion.
 		if appsutil.IsDeploymentCancelled(deployment) {
-			appsutil.DeleteStatusReasons(deployment)
-			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "FailedCancellation", "Succeeded before cancel recorded")
+			return appsv1.DeploymentStatusFailed
 		}
 		// Sync the internal replica annotation with the target so that we can
 		// distinguish deployer updates from other scaling events.
