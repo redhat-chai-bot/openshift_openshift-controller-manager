@@ -17,9 +17,11 @@ import (
 	kinformers "k8s.io/client-go/informers"
 	kclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	kcorelisters "k8s.io/client-go/listers/core/v1"
 	clientgotesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	kapitesting "k8s.io/kubernetes/pkg/api/testing"
 	kapihelper "k8s.io/kubernetes/pkg/apis/core/helper"
@@ -40,6 +42,16 @@ func alwaysReady() bool { return true }
 type deploymentController struct {
 	*DeploymentController
 	podIndexer cache.Indexer
+	rcIndexer  cache.Indexer
+}
+
+type podLookupErrorIndexer struct {
+	cache.Indexer
+	err error
+}
+
+func (i podLookupErrorIndexer) GetByKey(string) (interface{}, bool, error) {
+	return nil, false, i.err
 }
 
 func okDeploymentController(client kclientset.Interface, deployment *corev1.ReplicationController, hookPodNames []string, related bool, deployerStatus corev1.PodPhase) *deploymentController {
@@ -64,7 +76,11 @@ func okDeploymentController(client kclientset.Interface, deployment *corev1.Repl
 		podInformer.Informer().GetIndexer().Add(pod)
 	}
 
-	return &deploymentController{c, podInformer.Informer().GetIndexer()}
+	return &deploymentController{
+		DeploymentController: c,
+		podIndexer:           podInformer.Informer().GetIndexer(),
+		rcIndexer:            rcInformer.Informer().GetIndexer(),
+	}
 }
 
 func deployerPod(deployment *corev1.ReplicationController, alternateName string, related bool) *corev1.Pod {
@@ -451,10 +467,10 @@ func TestHandle_cancelledDeploymentIgnoresUnrelatedSucceededPod(t *testing.T) {
 	}{
 		{name: "New missing annotation", deploymentPhase: appsv1.DeploymentStatusNew, expectedDeploymentPhase: appsv1.DeploymentStatusPending},
 		{name: "New mismatched annotation", deploymentPhase: appsv1.DeploymentStatusNew, podDeploymentName: "other", expectedDeploymentPhase: appsv1.DeploymentStatusPending},
-		{name: "Pending missing annotation", deploymentPhase: appsv1.DeploymentStatusPending, expectedDeploymentPhase: appsv1.DeploymentStatusPending},
-		{name: "Pending mismatched annotation", deploymentPhase: appsv1.DeploymentStatusPending, podDeploymentName: "other", expectedDeploymentPhase: appsv1.DeploymentStatusPending},
-		{name: "Running missing annotation", deploymentPhase: appsv1.DeploymentStatusRunning, expectedDeploymentPhase: appsv1.DeploymentStatusRunning},
-		{name: "Running mismatched annotation", deploymentPhase: appsv1.DeploymentStatusRunning, podDeploymentName: "other", expectedDeploymentPhase: appsv1.DeploymentStatusRunning},
+		{name: "Pending missing annotation", deploymentPhase: appsv1.DeploymentStatusPending, expectedDeploymentPhase: appsv1.DeploymentStatusFailed},
+		{name: "Pending mismatched annotation", deploymentPhase: appsv1.DeploymentStatusPending, podDeploymentName: "other", expectedDeploymentPhase: appsv1.DeploymentStatusFailed},
+		{name: "Running missing annotation", deploymentPhase: appsv1.DeploymentStatusRunning, expectedDeploymentPhase: appsv1.DeploymentStatusFailed},
+		{name: "Running mismatched annotation", deploymentPhase: appsv1.DeploymentStatusRunning, podDeploymentName: "other", expectedDeploymentPhase: appsv1.DeploymentStatusFailed},
 	}
 
 	for _, test := range tests {
@@ -487,12 +503,12 @@ func TestHandle_cancelledDeploymentIgnoresUnrelatedSucceededPod(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error getting deployer pod: %v", err)
 			}
+			unrelatedPod = unrelatedPod.DeepCopy()
 			if len(test.podDeploymentName) == 0 {
 				unrelatedPod.Annotations = nil
 			} else {
 				unrelatedPod.Annotations[appsv1.DeploymentAnnotation] = test.podDeploymentName
 			}
-			delete(unrelatedPod.Labels, appsv1.DeployerPodForDeploymentLabel)
 			now := metav1.Now()
 			unrelatedPod.CreationTimestamp = now
 			unrelatedPod.Status.StartTime = &now
@@ -502,6 +518,7 @@ func TestHandle_cancelledDeploymentIgnoresUnrelatedSucceededPod(t *testing.T) {
 			if err := controller.podIndexer.Update(unrelatedPod); err != nil {
 				t.Fatalf("unexpected error updating unrelated pod: %v", err)
 			}
+			originalPod := unrelatedPod.DeepCopy()
 
 			hookPods := []string{"pre", "post"}
 			for _, name := range hookPods {
@@ -519,24 +536,10 @@ func TestHandle_cancelledDeploymentIgnoresUnrelatedSucceededPod(t *testing.T) {
 			if !reflect.DeepEqual(originalDeployment, deployment) {
 				t.Errorf("input deployment was mutated: %s", cmp.Diff(originalDeployment, deployment))
 			}
-			if deletedPods[deployerPodName] {
-				t.Errorf("unrelated pod %q was deleted", deployerPodName)
+			if updatedDeployment == nil {
+				t.Fatal("expected cancelled deployment update")
 			}
-			for _, name := range hookPods {
-				if !deletedPods[name] {
-					t.Errorf("related hook pod %q was not deleted", name)
-				}
-			}
-
-			result := deployment
-			if test.deploymentPhase == appsv1.DeploymentStatusNew {
-				if updatedDeployment == nil {
-					t.Fatal("expected cancelled New deployment update")
-				}
-				result = updatedDeployment
-			} else if updatedDeployment != nil {
-				t.Fatal("unexpected deployment update")
-			}
+			result := updatedDeployment
 			if status := appsutil.DeploymentStatusFor(result); status != test.expectedDeploymentPhase {
 				t.Errorf("expected deployment status %q, got %q", test.expectedDeploymentPhase, status)
 			}
@@ -565,10 +568,61 @@ func TestHandle_cancelledDeploymentIgnoresUnrelatedSucceededPod(t *testing.T) {
 			if value := result.Annotations["example.com/unrelated"]; value != "preserved" {
 				t.Errorf("expected unrelated deployment metadata to be preserved, got %q", value)
 			}
-			select {
-			case event := <-fakeRecorder.Events:
-				t.Errorf("unexpected deployment event: %s", event)
-			default:
+			if test.deploymentPhase == appsv1.DeploymentStatusNew {
+				// New cancellations first enter Pending, then fail on resync.
+				originalPending := result.DeepCopy()
+				if err := controller.handle(result, false); err != nil {
+					t.Fatalf("unexpected error reconciling Pending cancellation: %v", err)
+				}
+				if !reflect.DeepEqual(originalPending, result) {
+					t.Errorf("input Pending deployment was mutated: %s", cmp.Diff(originalPending, result))
+				}
+				result = updatedDeployment
+			}
+			if status := appsutil.DeploymentStatusFor(result); status != appsv1.DeploymentStatusFailed {
+				t.Fatalf("expected cancelled deployment to reach Failed, got %q", status)
+			}
+			expectedFailed := originalDeployment.DeepCopy()
+			expectedFailed.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusFailed)
+			if !reflect.DeepEqual(expectedFailed, result) {
+				t.Errorf("unexpected Failed deployment: %s", cmp.Diff(expectedFailed, result))
+			}
+
+			// Failed cancellations also clean up hooks created after the first pass.
+			hookPods = append(hookPods, "late-post")
+			if err := controller.podIndexer.Add(deployerPod(deployment, "late-post", true)); err != nil {
+				t.Fatalf("unexpected error adding late hook pod: %v", err)
+			}
+			if err := controller.handle(result, false); err != nil {
+				t.Fatalf("unexpected error cleaning up Failed cancellation: %v", err)
+			}
+			if !reflect.DeepEqual(expectedFailed, result) {
+				t.Errorf("input Failed deployment was mutated: %s", cmp.Diff(expectedFailed, result))
+			}
+			if deletedPods[deployerPodName] {
+				t.Errorf("unrelated pod %q was deleted", deployerPodName)
+			}
+			if !reflect.DeepEqual(originalPod, unrelatedPod) {
+				t.Errorf("unrelated pod was mutated: %s", cmp.Diff(originalPod, unrelatedPod))
+			}
+			for _, name := range hookPods {
+				if !deletedPods[name] {
+					t.Errorf("related hook pod %q was not deleted", name)
+				}
+			}
+			close(fakeRecorder.Events)
+			var events []string
+			for event := range fakeRecorder.Events {
+				events = append(events, event)
+			}
+			expectedEvents := []string{fmt.Sprintf("Normal RolloutCancelled Rollout for %q cancelled", appsutil.LabelForDeployment(deployment))}
+			if !reflect.DeepEqual(expectedEvents, events) {
+				t.Errorf("unexpected deployment events: %s", cmp.Diff(expectedEvents, events))
+			}
+			for _, action := range client.Actions() {
+				if !action.Matches("delete", "pods") && !action.Matches("update", "replicationcontrollers") {
+					t.Errorf("unexpected API action: %s %s", action.GetVerb(), action.GetResource().Resource)
+				}
 			}
 		})
 	}
@@ -799,6 +853,98 @@ func TestHandle_cleanupPodNoop(t *testing.T) {
 
 	if err := controller.handle(deployment, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHandle_lifecyclePodsRequireDeploymentAssociation(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancelled=%t", cancelled), func(t *testing.T) {
+			deployment, err := appsutil.MakeDeployment(appstest.OkDeploymentConfig(1))
+			if err != nil {
+				t.Fatalf("unexpected error creating deployment: %v", err)
+			}
+			deployment.UID = "deployment-uid"
+			deployment.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusRunning)
+			podPhase := corev1.PodRunning
+			if cancelled {
+				deployment.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusFailed)
+				appsutil.SetCancelledByUserReason(deployment)
+				podPhase = corev1.PodFailed
+			}
+			originalDeployment := deployment.DeepCopy()
+			client := fake.NewSimpleClientset()
+			controller := okDeploymentController(client, deployment, nil, true, podPhase)
+			// Internal lifecycle hooks carry both the deployment annotation and label.
+			hook := deployerPod(deployment, "pre-hook", true)
+			hook.Labels["openshift.io/deployer-pod.type"] = "pre"
+			missingAnnotation := deployerPod(deployment, "missing-annotation", false)
+			mismatchedAnnotation := deployerPod(deployment, "mismatched-annotation", true)
+			mismatchedAnnotation.Annotations[appsv1.DeploymentAnnotation] = "other"
+			missingLabel := deployerPod(deployment, "missing-label", true)
+			delete(missingLabel.Labels, appsv1.DeployerPodForDeploymentLabel)
+			for _, pod := range []*corev1.Pod{hook, missingAnnotation, mismatchedAnnotation, missingLabel} {
+				if err := controller.podIndexer.Add(pod); err != nil {
+					t.Fatalf("unexpected error adding pod: %v", err)
+				}
+			}
+			originalPods := map[string]*corev1.Pod{}
+			for _, obj := range controller.podIndexer.List() {
+				pod := obj.(*corev1.Pod)
+				originalPods[pod.Name] = pod.DeepCopy()
+				if err := client.Tracker().Add(pod.DeepCopy()); err != nil {
+					t.Fatalf("unexpected error tracking pod: %v", err)
+				}
+			}
+
+			if err := controller.handle(deployment, false); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(originalDeployment, deployment) {
+				t.Errorf("input deployment was mutated: %s", cmp.Diff(originalDeployment, deployment))
+			}
+			deployerPodName := appsutil.DeployerPodNameForDeployment(deployment.Name)
+			var touchedPods []string
+			for _, action := range client.Actions() {
+				switch {
+				case cancelled && action.Matches("delete", "pods"):
+					touchedPods = append(touchedPods, action.(clientgotesting.DeleteAction).GetName())
+				case !cancelled && action.Matches("patch", "pods"):
+					touchedPods = append(touchedPods, action.(clientgotesting.PatchAction).GetName())
+				default:
+					t.Errorf("unexpected API action: %s %s", action.GetVerb(), action.GetResource().Resource)
+				}
+			}
+			expectedTouchedPods := []string{deployerPodName, hook.Name}
+			sort.Strings(touchedPods)
+			sort.Strings(expectedTouchedPods)
+			if !reflect.DeepEqual(expectedTouchedPods, touchedPods) {
+				t.Errorf("unexpected lifecycle pod updates: %s", cmp.Diff(expectedTouchedPods, touchedPods))
+			}
+			for _, obj := range controller.podIndexer.List() {
+				pod := obj.(*corev1.Pod)
+				expectedPod := originalPods[pod.Name].DeepCopy()
+				if !reflect.DeepEqual(expectedPod, pod) {
+					t.Errorf("cached pod %q was mutated: %s", pod.Name, cmp.Diff(expectedPod, pod))
+				}
+				associated := pod.Name == deployerPodName || pod.Name == hook.Name
+				actualPod, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("pods"), pod.Namespace, pod.Name)
+				if cancelled && associated {
+					if !kerrors.IsNotFound(err) {
+						t.Errorf("expected associated pod %q to be deleted, got %v", pod.Name, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("unexpected error getting pod %q: %v", pod.Name, err)
+				}
+				if associated {
+					expectedPod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ReplicationController", Name: deployment.Name, UID: deployment.UID}}
+				}
+				if !reflect.DeepEqual(expectedPod, actualPod) {
+					t.Errorf("unexpected pod %q: %s", pod.Name, cmp.Diff(expectedPod, actualPod))
+				}
+			}
+		})
 	}
 }
 
@@ -1269,12 +1415,19 @@ func TestHandle_newDeploymentAfterTimeout(t *testing.T) {
 		name                    string
 		cancelled               bool
 		deployerExists          bool
+		deployerPhase           corev1.PodPhase
+		unrelated               bool
+		lookupErr               error
 		expectedDeploymentPhase appsv1.DeploymentStatus
 	}{
-		{name: "succeeded", deployerExists: true, expectedDeploymentPhase: appsv1.DeploymentStatusComplete},
-		{name: "cancelled succeeded", cancelled: true, deployerExists: true, expectedDeploymentPhase: appsv1.DeploymentStatusPending},
+		{name: "succeeded", deployerExists: true, deployerPhase: corev1.PodSucceeded, expectedDeploymentPhase: appsv1.DeploymentStatusComplete},
+		{name: "running", deployerExists: true, deployerPhase: corev1.PodRunning, expectedDeploymentPhase: appsv1.DeploymentStatusRunning},
+		{name: "cancelled succeeded", cancelled: true, deployerExists: true, deployerPhase: corev1.PodSucceeded, expectedDeploymentPhase: appsv1.DeploymentStatusPending},
+		{name: "cancelled running", cancelled: true, deployerExists: true, deployerPhase: corev1.PodRunning, expectedDeploymentPhase: appsv1.DeploymentStatusPending},
 		{name: "missing", expectedDeploymentPhase: appsv1.DeploymentStatusFailed},
 		{name: "cancelled missing", cancelled: true, expectedDeploymentPhase: appsv1.DeploymentStatusPending},
+		{name: "unrelated", deployerExists: true, deployerPhase: corev1.PodRunning, unrelated: true, expectedDeploymentPhase: appsv1.DeploymentStatusFailed},
+		{name: "lookup error", deployerExists: true, lookupErr: fmt.Errorf("injected lookup error"), expectedDeploymentPhase: appsv1.DeploymentStatusNew},
 	}
 
 	for _, test := range tests {
@@ -1298,11 +1451,14 @@ func TestHandle_newDeploymentAfterTimeout(t *testing.T) {
 			expectedAnnotations := deployment.DeepCopy().Annotations
 			expectedAnnotations[appsv1.DeploymentStatusAnnotation] = string(test.expectedDeploymentPhase)
 			if !test.cancelled {
-				if test.deployerExists {
+				switch {
+				case test.unrelated:
+					expectedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnrelatedDeploymentExists
+				case !test.deployerExists:
+					expectedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnableToCreateDeployerPod
+				case test.deployerPhase == corev1.PodSucceeded:
 					expectedAnnotations[appsutil.DeploymentReplicasAnnotation] = expectedAnnotations[appsv1.DesiredReplicasAnnotation]
 					delete(expectedAnnotations, appsv1.DesiredReplicasAnnotation)
-				} else {
-					expectedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnableToCreateDeployerPod
 				}
 			}
 			if !rolloutExceededTimeoutSeconds(config, deployment) {
@@ -1320,7 +1476,7 @@ func TestHandle_newDeploymentAfterTimeout(t *testing.T) {
 				updatedDeployment = action.(clientgotesting.UpdateAction).GetObject().(*corev1.ReplicationController)
 				return true, updatedDeployment, nil
 			})
-			controller := okDeploymentController(client, deployment, nil, true, corev1.PodSucceeded)
+			controller := okDeploymentController(client, deployment, nil, true, test.deployerPhase)
 			deployerPodName := appsutil.DeployerPodNameForDeployment(deployment.Name)
 			deployer, err := controller.podLister.Pods(deployment.Namespace).Get(deployerPodName)
 			if err != nil {
@@ -1330,27 +1486,49 @@ func TestHandle_newDeploymentAfterTimeout(t *testing.T) {
 				if err := controller.podIndexer.Delete(deployer); err != nil {
 					t.Fatalf("unexpected error deleting deployer from cache: %v", err)
 				}
-			} else if !test.cancelled {
+			} else {
+				deployer = deployer.DeepCopy()
+				deployer.CreationTimestamp = deployment.CreationTimestamp
+				if test.unrelated {
+					deployer.Annotations[appsv1.DeploymentAnnotation] = "other"
+				}
+				if err := controller.podIndexer.Update(deployer); err != nil {
+					t.Fatalf("unexpected error updating deployer: %v", err)
+				}
+			}
+			if test.deployerExists && !test.cancelled && !test.unrelated && test.lookupErr == nil {
 				expectedAnnotations[appsv1.DeploymentPodAnnotation] = deployer.Name
 				expectedAnnotations[appsv1.DeployerPodCreatedAtAnnotation] = deployer.CreationTimestamp.String()
+			}
+			if test.lookupErr != nil {
+				controller.podLister = kcorelisters.NewPodLister(podLookupErrorIndexer{Indexer: controller.podIndexer, err: test.lookupErr})
 			}
 			fakeRecorder := record.NewFakeRecorder(10)
 			controller.recorder = fakeRecorder
 
-			if err := controller.handle(deployment, false); err != nil {
+			err = controller.handle(deployment, false)
+			if test.lookupErr != nil {
+				if err == nil || updatedDeployment != nil {
+					t.Fatalf("expected retryable lookup error without deployment update, got update=%v, error=%v", updatedDeployment != nil, err)
+				}
+			} else if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if !reflect.DeepEqual(originalDeployment, deployment) {
 				t.Errorf("input deployment was mutated: %s", cmp.Diff(originalDeployment, deployment))
 			}
-			if updatedDeployment == nil {
+			if test.lookupErr == nil && updatedDeployment == nil {
 				t.Fatal("expected deployment update")
 			}
-			if status := appsutil.DeploymentStatusFor(updatedDeployment); status != test.expectedDeploymentPhase {
+			result := deployment
+			if updatedDeployment != nil {
+				result = updatedDeployment
+			}
+			if status := appsutil.DeploymentStatusFor(result); status != test.expectedDeploymentPhase {
 				t.Errorf("expected deployment status %q, got %q", test.expectedDeploymentPhase, status)
 			}
-			if !reflect.DeepEqual(expectedAnnotations, updatedDeployment.Annotations) {
-				t.Errorf("unexpected outgoing annotations: %s", cmp.Diff(expectedAnnotations, updatedDeployment.Annotations))
+			if !reflect.DeepEqual(expectedAnnotations, result.Annotations) {
+				t.Errorf("unexpected outgoing annotations: %s", cmp.Diff(expectedAnnotations, result.Annotations))
 			}
 			var expectedDeletedPods []string
 			if test.cancelled && test.deployerExists {
@@ -1367,6 +1545,8 @@ func TestHandle_newDeploymentAfterTimeout(t *testing.T) {
 			var expectedEvents []string
 			if !test.cancelled && !test.deployerExists {
 				expectedEvents = []string{fmt.Sprintf("Warning RolloutTimeout Rollout for %q failed to create deployer pod (timeoutSeconds: %ds)", appsutil.LabelForDeployment(deployment), timeoutSeconds)}
+			} else if test.unrelated {
+				expectedEvents = []string{fmt.Sprintf("Warning FailedCreate Error creating deployer pod since another pod with the same name (%q) exists", deployerPodName)}
 			}
 			if !reflect.DeepEqual(expectedEvents, events) {
 				t.Errorf("unexpected deployment events: %s", cmp.Diff(expectedEvents, events))
@@ -1498,6 +1678,103 @@ func TestHandle_cancelledDeploymentSucceeded(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWork_retriesCancelledDeploymentWithFreshAnnotations(t *testing.T) {
+	deployment, err := appsutil.MakeDeployment(appstest.OkDeploymentConfig(1))
+	if err != nil {
+		t.Fatalf("unexpected error creating deployment: %v", err)
+	}
+	deployment.ResourceVersion = "42"
+	deployment.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusRunning)
+	appsutil.SetCancelledByUserReason(deployment)
+	originalDeployment := deployment.DeepCopy()
+	freshDeployment := deployment.DeepCopy()
+	freshDeployment.ResourceVersion = "43"
+	freshDeployment.Annotations["example.com/fresh"] = "preserved"
+	originalFreshDeployment := freshDeployment.DeepCopy()
+
+	var updatedDeployment *corev1.ReplicationController
+	updateAttempts := 0
+	deletedPods := map[string]int{}
+	client := &fake.Clientset{}
+	client.AddReactor("delete", "pods", func(action clientgotesting.Action) (handled bool, ret runtime.Object, err error) {
+		deletedPods[action.(clientgotesting.DeleteAction).GetName()]++
+		return true, nil, nil
+	})
+	client.AddReactor("update", "replicationcontrollers", func(action clientgotesting.Action) (handled bool, ret runtime.Object, err error) {
+		updateAttempts++
+		outgoing := action.(clientgotesting.UpdateAction).GetObject().(*corev1.ReplicationController)
+		expected := originalDeployment.DeepCopy()
+		if updateAttempts > 1 {
+			expected = originalFreshDeployment.DeepCopy()
+		}
+		expected.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusFailed)
+		if !reflect.DeepEqual(expected, outgoing) {
+			t.Errorf("unexpected outgoing deployment on attempt %d: %s", updateAttempts, cmp.Diff(expected, outgoing))
+		}
+		if updateAttempts == 1 {
+			return true, nil, kerrors.NewConflict(corev1.Resource("replicationcontrollers"), deployment.Name, fmt.Errorf("injected conflict"))
+		}
+		updatedDeployment = outgoing
+		return true, outgoing, nil
+	})
+	controller := okDeploymentController(client, deployment, []string{"pre", "post"}, true, corev1.PodSucceeded)
+	controller.queue.ShutDown()
+	controller.queue = workqueue.NewRateLimitingQueue(workqueue.NewItemFastSlowRateLimiter(0, 0, 1))
+	defer controller.queue.ShutDown()
+	if err := controller.rcIndexer.Add(deployment); err != nil {
+		t.Fatalf("unexpected error caching deployment: %v", err)
+	}
+	fakeRecorder := record.NewFakeRecorder(10)
+	controller.recorder = fakeRecorder
+	key := deployment.Namespace + "/" + deployment.Name
+	controller.queue.Add(key)
+
+	if quit := controller.work(); quit {
+		t.Fatal("worker unexpectedly stopped after conflict")
+	}
+	if updateAttempts != 1 || updatedDeployment != nil || controller.queue.NumRequeues(key) != 1 || controller.queue.Len() != 1 {
+		t.Fatalf("expected conflict to queue one retry: attempts=%d, updated=%t, retries=%d, queued=%d", updateAttempts, updatedDeployment != nil, controller.queue.NumRequeues(key), controller.queue.Len())
+	}
+	select {
+	case event := <-fakeRecorder.Events:
+		t.Errorf("unexpected event after conflict: %s", event)
+	default:
+	}
+	if err := controller.rcIndexer.Update(freshDeployment); err != nil {
+		t.Fatalf("unexpected error refreshing cached deployment: %v", err)
+	}
+	if pod, err := controller.podLister.Pods(deployment.Namespace).Get(appsutil.DeployerPodNameForDeployment(deployment.Name)); err != nil || pod.Status.Phase != corev1.PodSucceeded {
+		t.Fatalf("matching Succeeded deployer must remain available for retry: pod=%v, error=%v", pod, err)
+	}
+	if quit := controller.work(); quit {
+		t.Fatal("worker unexpectedly stopped on retry")
+	}
+	if updateAttempts != 2 || updatedDeployment == nil || controller.queue.NumRequeues(key) != 0 || controller.queue.Len() != 0 {
+		t.Fatalf("expected successful retry: attempts=%d, updated=%t, retries=%d, queued=%d", updateAttempts, updatedDeployment != nil, controller.queue.NumRequeues(key), controller.queue.Len())
+	}
+	if !reflect.DeepEqual(originalDeployment, deployment) || !reflect.DeepEqual(originalFreshDeployment, freshDeployment) {
+		t.Error("worker mutated an informer-owned deployment")
+	}
+	expectedDeletedPods := map[string]int{"pre": 2, "post": 2, appsutil.DeployerPodNameForDeployment(deployment.Name): 2}
+	if !reflect.DeepEqual(expectedDeletedPods, deletedPods) {
+		t.Errorf("unexpected pod cleanup: %s", cmp.Diff(expectedDeletedPods, deletedPods))
+	}
+	close(fakeRecorder.Events)
+	var events []string
+	for event := range fakeRecorder.Events {
+		events = append(events, event)
+	}
+	expectedEvents := []string{fmt.Sprintf("Normal RolloutCancelled Rollout for %q cancelled", appsutil.LabelForDeployment(deployment))}
+	if !reflect.DeepEqual(expectedEvents, events) {
+		t.Errorf("unexpected deployment events: %s", cmp.Diff(expectedEvents, events))
+	}
+	for _, action := range client.Actions() {
+		if !action.Matches("delete", "pods") && !action.Matches("update", "replicationcontrollers") {
+			t.Errorf("unexpected API action: %s %s", action.GetVerb(), action.GetResource().Resource)
+		}
 	}
 }
 

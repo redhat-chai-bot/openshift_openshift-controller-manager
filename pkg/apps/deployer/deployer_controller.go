@@ -141,9 +141,8 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 		if err != nil {
 			return err
 		}
-		// A successful deployer takes precedence: this timeout only covers failure
-		// to create a deployer pod.
-		if nextStatus != appsv1.DeploymentStatusComplete && rolloutExceededTimeoutSeconds(config, deployment) {
+		// This timeout only covers failure to create a deployer pod.
+		if kerrors.IsNotFound(deployerErr) && rolloutExceededTimeoutSeconds(config, deployment) {
 			nextStatus = appsv1.DeploymentStatusFailed
 			updatedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnableToCreateDeployerPod
 			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "RolloutTimeout", fmt.Sprintf("Rollout for %q failed to create deployer pod (timeoutSeconds: %ds)", appsutil.LabelForDeployment(deployment),
@@ -214,10 +213,10 @@ func (c *DeploymentController) handle(deployment *corev1.ReplicationController, 
 
 	case appsv1.DeploymentStatusPending, appsv1.DeploymentStatusRunning:
 		switch {
-		case kerrors.IsNotFound(deployerErr):
+		// A rejected same-name pod cannot keep a cancelled deployment in flight.
+		case kerrors.IsNotFound(deployerErr) || (deployerErr == nil && !deployerBelongsToDeployment && appsutil.IsDeploymentCancelled(deployment)):
 			nextStatus = appsv1.DeploymentStatusFailed
-			// If the deployment is cancelled here then we deleted the deployer in a previous
-			// resync of the deployment.
+			// Preserve the recorded reason for a cancellation.
 			if !appsutil.IsDeploymentCancelled(deployment) {
 				// Retry more before setting the deployment to Failed if it's Pending - the pod might not have
 				// appeared in the cache yet.
@@ -498,7 +497,17 @@ func (c *DeploymentController) makeDeployerContainer(strategy *appsv1.Deployment
 }
 
 func (c *DeploymentController) getDeployerPods(deployment *corev1.ReplicationController) ([]*corev1.Pod, error) {
-	return c.podLister.Pods(deployment.Namespace).List(appsutil.DeployerPodSelector(deployment.Name))
+	pods, err := c.podLister.Pods(deployment.Namespace).List(appsutil.DeployerPodSelector(deployment.Name))
+	if err != nil {
+		return nil, err
+	}
+	var deployerPods []*corev1.Pod
+	for _, pod := range pods {
+		if appsutil.DeploymentNameFor(pod) == deployment.Name {
+			deployerPods = append(deployerPods, pod)
+		}
+	}
+	return deployerPods, nil
 }
 
 func (c *DeploymentController) setDeployerPodsOwnerRef(deployment *corev1.ReplicationController) error {
